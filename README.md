@@ -39,6 +39,22 @@ Run manually:
 py -3 chat.py --mode server
 ```
 
+### (Optional) Show client location (GeoIP)
+
+The server can **optionally** display an approximate location (city/region/country)
+for **public** client IPs. This is best-effort and **requires internet**.
+
+Enable:
+
+```bat
+py -3 chat.py --mode server --geoip
+```
+
+Notes:
+
+- For LAN/private IPs (e.g. `192.168.x.x`), it will show `LAN/private`.
+- This only affects the server console output (it does not broadcast location to clients).
+
 Reset password:
 
 ```bat
@@ -53,11 +69,32 @@ Run manually:
 py -3 chat.py --mode client --server 192.168.1.10
 ```
 
+### (Optional) Send GPS / Windows Location Services to server
+
+If Windows Location Services is enabled, the client can send coordinates (latitude/longitude)
+to the server **with your consent**.
+
+Send once on connect:
+
+```bat
+py -3 chat.py --mode client --server 192.168.1.10 --gps
+```
+
+Or while connected, type:
+
+- `/gps` (sent to server console only)
+
+Notes:
+
+- This requires Windows location permission and may fail if blocked/disabled.
+- The server logs it and acknowledges only to the sender (not broadcast to others).
+
 ## Chat commands
 
 - `/help` show help
 - `/quit` quit
 - `/cls` clear screen
+- `/gps` send current Windows location to server (server-only)
 
 ## Nicer CMD output (optional)
 

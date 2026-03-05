@@ -13,6 +13,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -20,13 +21,145 @@ import socket
 import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
+import subprocess
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 5050
 DEFAULT_CONFIG = "chat_config.json"
 ENCODING = "utf-8"
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return bool(
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+        )
+    except ValueError:
+        return False
+
+
+def _geoip_lookup_ipwhois(ip: str, *, timeout_s: float) -> Optional[str]:
+    """Best-effort GeoIP lookup.
+
+    This is intentionally optional and should not break offline usage.
+    Returns a short human-readable location string or None.
+    """
+    if not ip or _is_private_ip(ip):
+        return None
+
+    # Public API with HTTPS and no key requirement.
+    url = f"https://ipwho.is/{ip}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "terminal-chat/1.0 (+https://local)",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    data = cast(dict[str, Any], parsed)
+    if not data.get("success"):
+        return None
+
+    city = str(data.get("city") or "").strip()
+    region = str(data.get("region") or "").strip()
+    country = str(data.get("country") or "").strip()
+
+    parts = [p for p in [city, region, country] if p]
+    if not parts:
+        return None
+    return ", ".join(parts)
+
+
+def _get_windows_gps_location(*, timeout_s: float) -> Optional[dict[str, Any]]:
+    """Return current GPS/location via Windows Location Services (best-effort).
+
+    - Requires Windows location permission enabled for the user/system.
+    - Uses PowerShell + WinRT Geolocator to avoid extra Python deps.
+    - Returns dict with latitude/longitude/accuracy when available.
+    """
+    if os.name != "nt":
+        return None
+
+    # PowerShell script: emit a single JSON object or nothing.
+    # Note: WinRT APIs may throw when location is disabled/blocked.
+    ps = r"""
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime | Out-Null
+  [Windows.Devices.Geolocation.Geolocator, Windows.Devices.Geolocation, ContentType = WindowsRuntime] | Out-Null
+
+  $geo = New-Object Windows.Devices.Geolocation.Geolocator
+  $async = $geo.GetGeopositionAsync()
+  $task = [System.WindowsRuntimeSystemExtensions]::AsTask($async)
+  $ok = $task.Wait([TimeSpan]::FromMilliseconds(%TIMEOUT_MS%))
+  if (-not $ok) { return }
+
+  $pos = $task.Result
+  if ($null -eq $pos) { return }
+
+  $p = $pos.Coordinate.Point.Position
+  $obj = [ordered]@{
+    latitude = [double]$p.Latitude
+    longitude = [double]$p.Longitude
+    accuracy_m = [double]$pos.Coordinate.Accuracy
+    timestamp_utc = $pos.Coordinate.Timestamp.UtcDateTime.ToString('o')
+  }
+  $obj | ConvertTo-Json -Compress
+} catch {
+  # no output
+}
+""".replace("%TIMEOUT_MS%", str(max(100, int(timeout_s * 1000))))
+
+    try:
+        res = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_s + 2.0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    out = (res.stdout or "").strip()
+    if not out:
+        return None
+
+    try:
+        parsed = json.loads(out)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return cast(dict[str, Any], parsed)
 
 
 def _normalize_fp(text: str) -> str:
@@ -210,6 +343,8 @@ class ChatServer:
         tls: bool,
         tls_cert: Optional[str],
         tls_key: Optional[str],
+        geoip: bool,
+        geoip_timeout_s: float,
     ) -> None:
         self.host = host
         self.port = port
@@ -221,6 +356,11 @@ class ChatServer:
         self._clients: list[ConnectedClient] = []
         self._clients_lock = threading.Lock()
         self._stop = threading.Event()
+
+        self._geoip = bool(geoip)
+        self._geoip_timeout_s = float(geoip_timeout_s)
+        self._geoip_cache: dict[str, Optional[str]] = {}
+        self._geoip_lock = threading.Lock()
 
         self._ssl_context: Optional[ssl.SSLContext] = None
         if self.tls:
@@ -338,7 +478,25 @@ class ChatServer:
 
             _json_send_line(writer, {"type": "auth_ok", "message": "welcome"})
             self._broadcast({"type": "system", "message": f"{name} joined.", "ts": int(time.time())}, exclude=cc)
-            print(f"[+] {name} connected from {addr[0]}:{addr[1]}")
+
+            loc_suffix = ""
+            if self._geoip:
+                ip = str(addr[0])
+                if _is_private_ip(ip):
+                    loc_suffix = " (LAN/private)"
+                else:
+                    with self._geoip_lock:
+                        cached = self._geoip_cache.get(ip)
+                    if cached is None and ip not in self._geoip_cache:
+                        # cache miss: perform lookup (best-effort)
+                        looked = _geoip_lookup_ipwhois(ip, timeout_s=self._geoip_timeout_s)
+                        with self._geoip_lock:
+                            self._geoip_cache[ip] = looked
+                        cached = looked
+                    if cached:
+                        loc_suffix = f" ({cached})"
+
+            print(f"[+] {name} connected from {addr[0]}:{addr[1]}{loc_suffix}")
 
             while True:
                 msg = _json_recv_line(reader)
@@ -358,6 +516,18 @@ class ChatServer:
                         "ts": int(time.time()),
                     }
                     self._broadcast(payload)
+                elif msg.get("type") == "gps":
+                    gps = msg.get("gps")
+                    if isinstance(gps, dict):
+                        gps_d = cast(dict[str, Any], gps)
+                        lat = gps_d.get("latitude")
+                        lon = gps_d.get("longitude")
+                        acc = gps_d.get("accuracy_m")
+                        tsu = gps_d.get("timestamp_utc")
+                        print(f"[i] {name} location: lat={lat}, lon={lon}, acc_m={acc}, ts_utc={tsu}")
+                        _json_send_line(writer, {"type": "system", "message": "Location received (server-only).", "ts": int(time.time())})
+                    else:
+                        _json_send_line(writer, {"type": "error", "message": "invalid_gps"})
                 elif msg.get("type") == "ping":
                     _json_send_line(writer, {"type": "pong", "ts": int(time.time())})
                 else:
@@ -394,6 +564,8 @@ class ChatClient:
         use_color: bool,
         show_timestamps: bool,
         set_title: bool,
+        gps_on_connect: bool,
+        gps_timeout_s: float,
     ) -> None:
         self.server_host = server_host
         self.port = port
@@ -406,6 +578,8 @@ class ChatClient:
         self.use_color = use_color
         self.show_timestamps = show_timestamps
         self.set_title = set_title
+        self.gps_on_connect = bool(gps_on_connect)
+        self.gps_timeout_s = float(gps_timeout_s)
 
     def _c(self, text: str, color: str) -> str:
         if not self.use_color:
@@ -476,7 +650,12 @@ class ChatClient:
         if not hello or hello.get("type") != "hello":
             raise RuntimeError("Incompatible server")
 
-        _json_send_line(self.writer, {"type": "auth", "name": self.name, "password": self.password})
+        auth_payload: dict[str, Any] = {"type": "auth", "name": self.name, "password": self.password}
+        if self.gps_on_connect:
+            gps = _get_windows_gps_location(timeout_s=self.gps_timeout_s)
+            if gps is not None:
+                auth_payload["gps"] = gps
+        _json_send_line(self.writer, auth_payload)
         resp = _json_recv_line(self.reader)
         if not resp:
             raise RuntimeError("Server did not respond")
@@ -531,6 +710,14 @@ class ChatClient:
                     print("  /help  Show help")
                     print("  /quit  Quit")
                     print("  /cls   Clear screen")
+                    print("  /gps   Send your current Windows location to the server (server-only)")
+                    continue
+                if line.lower() in {"/gps", "/loc", "/location"}:
+                    gps = _get_windows_gps_location(timeout_s=self.gps_timeout_s)
+                    if gps is None:
+                        self._print_system("Location unavailable (check Windows Location permission).", int(time.time()))
+                        continue
+                    _json_send_line(self.writer, {"type": "gps", "gps": gps})
                     continue
                 if line.lower() in {"/cls", "/clear"}:
                     os.system("cls" if os.name == "nt" else "clear")
@@ -589,6 +776,18 @@ def main() -> int:
     parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"(server) Config path, default {DEFAULT_CONFIG}")
     parser.add_argument("--reset-password", action="store_true", help="(server) Reset password")
 
+    parser.add_argument(
+        "--geoip",
+        action="store_true",
+        help="(server) Show approximate location for public client IPs (requires internet; best-effort)",
+    )
+    parser.add_argument(
+        "--geoip-timeout",
+        type=float,
+        default=2.5,
+        help="(server) GeoIP lookup timeout in seconds (default: 2.5)",
+    )
+
     parser.add_argument("--tls", action="store_true", help="Enable TLS transport")
     parser.add_argument("--tls-cert", help="(server) TLS certificate PEM file")
     parser.add_argument("--tls-key", help="(server) TLS private key PEM file")
@@ -609,6 +808,18 @@ def main() -> int:
     parser.add_argument("--no-color", action="store_true", help="(client) Disable colored output")
     parser.add_argument("--no-ts", action="store_true", help="(client) Hide timestamps")
     parser.add_argument("--no-title", action="store_true", help="(client) Do not set the CMD window title")
+
+    parser.add_argument(
+        "--gps",
+        action="store_true",
+        help="(client) Send current Windows Location Services coordinates to server on connect (server-only)",
+    )
+    parser.add_argument(
+        "--gps-timeout",
+        type=float,
+        default=5.0,
+        help="(client) GPS/location lookup timeout in seconds (default: 5.0)",
+    )
 
     args = parser.parse_args()
 
@@ -634,6 +845,8 @@ def main() -> int:
             tls=bool(args.tls),
             tls_cert=args.tls_cert,
             tls_key=args.tls_key,
+            geoip=bool(args.geoip),
+            geoip_timeout_s=float(args.geoip_timeout),
         )
         server.serve_forever()
         return 0
@@ -689,6 +902,8 @@ def main() -> int:
             use_color=use_color,
             show_timestamps=show_timestamps,
             set_title=set_title,
+            gps_on_connect=bool(args.gps),
+            gps_timeout_s=float(args.gps_timeout),
         )
         client.sock = sock
         client.reader = sock.makefile("r", encoding="utf-8", newline="\n")
