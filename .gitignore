@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Chat configs (contain password hash / test artifacts)
+chat_config.json
+chat_test.json
+*.tmp
+
+# OS
+Thumbs.db
+Desktop.ini
