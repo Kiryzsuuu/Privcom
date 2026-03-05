@@ -402,6 +402,13 @@ class ChatClient:
         if resp.get("type") != "auth_ok":
             raise RuntimeError(f"Gagal login: {resp}")
 
+        # Avoid idle read timeouts: after auth, keep the connection open indefinitely.
+        # (The initial 15s timeout is only for connect+handshake.)
+        try:
+            self.sock.settimeout(None)
+        except Exception:
+            pass
+
         if self.set_title and os.name == "nt":
             safe_host = self.server_host.replace("\"", "").replace("\r", "").replace("\n", "")
             safe_name = self.name.replace("\"", "").replace("\r", "").replace("\n", "")
@@ -461,7 +468,11 @@ class ChatClient:
     def _recv_loop(self) -> None:
         assert self.reader is not None
         while not self._stop.is_set():
-            msg = _json_recv_line(self.reader)
+            try:
+                msg = _json_recv_line(self.reader)
+            except TimeoutError:
+                # Should not happen when socket timeout is None, but be defensive.
+                continue
             if msg is None:
                 print("[i] Terputus dari server.")
                 self._stop.set()
