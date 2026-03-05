@@ -7,6 +7,16 @@ chat_config.json
 chat_test.json
 *.tmp
 
+# TLS material (never commit private keys)
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+
+# Logs
+*.log
+
 # OS
 Thumbs.db
 Desktop.ini

@@ -1,160 +1,144 @@
 # Terminal Chat (CMD) + Password
 
-Program chat dua arah yang dijalankan lewat terminal Windows (CMD/PowerShell). Cocok untuk komunikasi di **LAN tanpa internet**.
+Two-way chat over the Windows terminal (CMD/PowerShell). Designed for **LAN / direct IP** use.
 
-> Catatan penting: “tanpa internet tapi jarak jauh” **tetap butuh jalur jaringan** apa pun (mis. VPN, port-forwarding, jaringan seluler/satelit dari provider). Kalau tidak ada *network path* sama sekali, komputer tidak bisa saling kirim pesan jarak jauh.
+Important: “No VPN” is possible, but you still need a **network path** from the client to `IP:PORT` (LAN, port-forwarding, public server, etc.). If there is no network path at all, two computers cannot exchange messages.
 
-## Syarat
+## Requirements
 
 - Windows 10/11
-- Python 3.10+ (disarankan). Di Windows biasanya tersedia perintah `py -3`.
+- Python 3.10+
 
-Cek:
+Check:
 
 ```bat
 py -3 --version
 ```
 
-## Cara pakai (sekali klik)
+If `py -3` is not available, `chat.bat` will try `python` / `python3` automatically.
 
-1. Jalankan `chat.bat` (double-click).
-2. Pilih:
-   - `1` untuk **SERVER** (komputer yang jadi host)
-   - `2` untuk **CLIENT** (komputer yang ikut chat)
+## Quick start (double-click)
 
-## SERVER (host)
+1. Run `chat.bat`.
+2. Select:
+   - `1` for **SERVER** (host)
+   - `2` for **CLIENT**
 
-Saat server pertama kali dijalankan, kamu akan diminta membuat password. Password disimpan sebagai **hash** (bukan plaintext) di file `chat_config.json` di folder yang sama.
+## Server (host)
 
-Opsi utama:
+On first run, the server asks you to create a password. The password is stored as a **hash** (not plaintext) in `chat_config.json`.
 
-- Port default: `5050`
-- Bind default: `0.0.0.0` (menerima koneksi dari LAN)
+Default settings:
 
-Jalankan manual (opsional):
+- Port: `5050`
+- Bind host: `0.0.0.0` (accept connections from LAN)
+
+Run manually:
 
 ```bat
 py -3 chat.py --mode server
 ```
 
-Reset password (opsional):
+Reset password:
 
 ```bat
 py -3 chat.py --mode server --reset-password
 ```
 
-## CLIENT
+## Client
 
-Client akan diminta:
-
-- `Server IP/hostname` (contoh: `192.168.1.10`)
-- `Nama kamu`
-- `Password`
-
-Jalankan manual (opsional):
+Run manually:
 
 ```bat
 py -3 chat.py --mode client --server 192.168.1.10
 ```
 
-## Perintah di chat
+## Chat commands
 
-- `/help` menampilkan bantuan
-- `/quit` keluar
-- `/cls` membersihkan layar
+- `/help` show help
+- `/quit` quit
+- `/cls` clear screen
 
-## Tampilan CMD yang lebih “pro”
+## Nicer CMD output (optional)
 
-Client akan menampilkan nama pengirim berwarna dan timestamp (jika terminal mendukung ANSI). Ini hanya untuk kenyamanan, tidak mengubah cara kerja jaringan.
+The client can show colored names + timestamps (when ANSI is supported).
 
-Opsi client:
+Options:
 
-- Matikan warna: `--no-color`
-- Matikan timestamp: `--no-ts`
+- Disable color: `--no-color`
+- Hide timestamps: `--no-ts`
 
-Contoh:
-
-```bat
-py -3 chat.py --mode client --server 100.x.y.z --no-color
-```
-
-Jika warna tidak muncul di CMD lama, kamu bisa install dependency opsional:
+If colors do not show on older CMD, install:
 
 ```bat
 py -3 -m pip install colorama
 ```
 
-## Otomasi / non-interaktif (opsional)
+## Automation / non-interactive (optional)
 
-Jika kamu ingin scripting (atau testing), kamu bisa:
-
-- Set password setup server via env (lebih aman daripada argumen CLI):
+- Reset server password via environment variables:
 
 ```bat
-set CHAT_SETUP_PASSWORD=PasswordKamu
-set CHAT_SETUP_PASSWORD_CONFIRM=PasswordKamu
+set CHAT_SETUP_PASSWORD=YourPassword
+set CHAT_SETUP_PASSWORD_CONFIRM=YourPassword
 py -3 chat.py --mode server --reset-password
 ```
 
-- Jalankan client tanpa prompt password:
+- Send one message and exit:
 
 ```bat
-set CHAT_PASSWORD=PasswordKamu
-py -3 chat.py --mode client --server 127.0.0.1 --name Alice --once "halo"
+set CHAT_PASSWORD=YourPassword
+py -3 chat.py --mode client --server 127.0.0.1 --name Alice --once "hello"
 ```
 
-## Tips koneksi tanpa internet (LAN)
+## Remote use (most secure)
 
-- Pastikan kedua PC berada di Wi‑Fi yang sama atau terhubung kabel LAN.
-- Cari IP server dengan:
+For use over the internet/WAN, the safest option is **TLS encryption + certificate fingerprint pinning**.
+
+### 1) Create a self-signed certificate (OpenSSL)
+
+If you have `openssl` available:
 
 ```bat
-ipconfig
+openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes ^
+  -keyout server.key -out server.crt -subj "/CN=terminal-chat"
 ```
 
-- Jika Windows Firewall memblokir, izinkan Python menerima koneksi (atau buka port 5050 untuk jaringan Private).
+### 2) Get the SHA256 fingerprint
 
-## Remote jarak jauh (butuh jalur jaringan)
-
-Kalau ingin dipakai jarak jauh, kamu perlu salah satu:
-
-- VPN (mis. WireGuard/Tailscale/ZeroTier) lalu pakai IP VPN
-- Port forwarding dari router ke PC server (hati-hati keamanan)
-- Jaringan data seluler/satelit dari provider (tetap “internet/wan” secara praktik)
-
-Program ini bekerja selama client bisa menjangkau `IP:PORT` server.
-
-## Rekomendasi: pakai VPN saja (paling mudah)
-
-### Opsi A (paling gampang): Tailscale
-
-1. Install Tailscale di **PC Server** dan **PC Client**.
-2. Login ke akun yang sama (atau satu tailnet yang sama) dan pastikan status **Connected**.
-3. Ambil IP Tailscale di PC Server (biasanya format `100.x.y.z`).
-   - Bisa lihat dari aplikasi Tailscale, atau jalankan `tailscale ip -4` jika CLI tersedia.
-4. Jalankan server:
+Use the built-in helper:
 
 ```bat
-py -3 chat.py --mode server --port 5050
+py -3 chat.py --print-fingerprint server.crt
 ```
 
-5. Di PC Client, jalankan client dan isi `Server IP/hostname` dengan IP Tailscale server:
+### 3) Run server with TLS
 
 ```bat
-py -3 chat.py --mode client --server 100.x.y.z --port 5050
+py -3 chat.py --mode server --tls --tls-cert server.crt --tls-key server.key
 ```
 
-Jika ada masalah koneksi:
-- Pastikan Windows Firewall mengizinkan Python untuk jaringan **Private** (atau rule inbound port `5050`).
-- Pastikan kedua perangkat benar-benar terhubung di Tailscale (ping antar device harus jalan).
-
-### Opsi B: WireGuard (lebih teknis, tapi ringan)
-
-1. Buat tunnel WireGuard (bisa via server VPS/rumah sebagai “hub”, atau site-to-site).
-2. Pastikan PC Server dan Client saling bisa ping lewat IP WireGuard (mis. `10.7.0.1` ↔ `10.7.0.2`).
-3. Jalankan server seperti biasa (bind `0.0.0.0` sudah OK).
-4. Client konek ke IP WireGuard server:
+### 4) Run client with TLS + fingerprint pinning
 
 ```bat
-py -3 chat.py --mode client --server 10.7.0.1 --port 5050
+py -3 chat.py --mode client --tls --tls-fingerprint YOUR_SHA256_FP --server SERVER_IP_OR_DNS
+```
+
+Notes:
+
+- If you do **not** provide `--tls-fingerprint`, the client will use the system trust store + hostname validation (best when using a CA-signed certificate for a real domain).
+- Fingerprint pinning is the recommended approach for self-signed certs.
+
+## Remote use without VPN (port forwarding)
+
+This works if your server machine can be reached from outside.
+
+1. Give the server a stable LAN IP (DHCP reservation recommended).
+2. On your router, forward TCP `5050` -> `SERVER_LAN_IP:5050`.
+3. Check for **CGNAT**: if your router WAN IP is in `10.x.x.x`, `192.168.x.x`, or `100.64.x.x`, port-forwarding from the internet usually won’t work.
+
+Then connect from outside:
+
+```bat
+py -3 chat.py --mode client --server PUBLIC_IP_OR_DDNS --port 5050
 ```

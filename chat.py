@@ -17,6 +17,7 @@ import json
 import os
 import secrets
 import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -26,6 +27,18 @@ PROTOCOL_VERSION = 1
 DEFAULT_PORT = 5050
 DEFAULT_CONFIG = "chat_config.json"
 ENCODING = "utf-8"
+
+
+def _normalize_fp(text: str) -> str:
+    """Normalize certificate fingerprint input.
+
+    Accepts hex with optional ':' separators. Returns lowercase hex without separators.
+    """
+    return "".join(ch for ch in text.strip().lower() if ch in "0123456789abcdef")
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _supports_color() -> bool:
@@ -96,9 +109,9 @@ def _ensure_password_config(path: str, reset: bool) -> dict[str, Any]:
         return existing
 
     if existing is None:
-        print(f"[i] Config belum ada: {path}")
+        print(f"[i] Config not found: {path}")
     else:
-        print(f"[i] Reset password untuk config: {path}")
+        print(f"[i] Resetting password for config: {path}")
 
     env_pw = os.environ.get("CHAT_SETUP_PASSWORD")
     env_pw2 = os.environ.get("CHAT_SETUP_PASSWORD_CONFIRM")
@@ -106,19 +119,19 @@ def _ensure_password_config(path: str, reset: bool) -> dict[str, Any]:
         pw1 = env_pw
         pw2 = env_pw if env_pw2 is None else env_pw2
         if not pw1:
-            raise ValueError("CHAT_SETUP_PASSWORD tidak boleh kosong")
+            raise ValueError("CHAT_SETUP_PASSWORD must not be empty")
         if pw1 != pw2:
-            raise ValueError("CHAT_SETUP_PASSWORD_CONFIRM tidak cocok")
-        print("[i] Password di-set dari environment variable.")
+            raise ValueError("CHAT_SETUP_PASSWORD_CONFIRM does not match")
+        print("[i] Password set from environment variables.")
     else:
         while True:
-            pw1 = getpass.getpass("Buat password baru: ")
-            pw2 = getpass.getpass("Ulangi password: ")
+            pw1 = getpass.getpass("Create new password: ")
+            pw2 = getpass.getpass("Confirm password: ")
             if not pw1:
-                print("[!] Password tidak boleh kosong.")
+                print("[!] Password must not be empty.")
                 continue
             if pw1 != pw2:
-                print("[!] Password tidak sama, coba lagi.")
+                print("[!] Passwords do not match, try again.")
                 continue
             break
 
@@ -137,7 +150,7 @@ def _ensure_password_config(path: str, reset: bool) -> dict[str, Any]:
         "created_at": int(time.time()),
     }
     _save_config(path, cfg)
-    print("[i] Password tersimpan (hash) di config.")
+    print("[i] Password saved (hashed) in config.")
     return cfg
 
 
@@ -187,22 +200,45 @@ class ConnectedClient:
 
 
 class ChatServer:
-    def __init__(self, host: str, port: int, config_path: str, reset_password: bool) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        config_path: str,
+        reset_password: bool,
+        *,
+        tls: bool,
+        tls_cert: Optional[str],
+        tls_key: Optional[str],
+    ) -> None:
         self.host = host
         self.port = port
         self.cfg = _ensure_password_config(config_path, reset_password)
+        self.tls = tls
+        self.tls_cert = tls_cert
+        self.tls_key = tls_key
         self._sock: Optional[socket.socket] = None
         self._clients: list[ConnectedClient] = []
         self._clients_lock = threading.Lock()
         self._stop = threading.Event()
+
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        if self.tls:
+            if not self.tls_cert or not self.tls_key:
+                raise ValueError("TLS enabled but --tls-cert/--tls-key not provided")
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.load_cert_chain(certfile=self.tls_cert, keyfile=self.tls_key)
+            self._ssl_context = ctx
 
     def serve_forever(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind((self.host, self.port))
         self._sock.listen(50)
-        print(f"[+] Server listening di {self.host}:{self.port}")
-        print("[i] Stop: tekan Ctrl+C")
+        transport = "TLS" if self.tls else "TCP"
+        print(f"[+] Server listening on {self.host}:{self.port} ({transport})")
+        print("[i] Stop: press Ctrl+C")
 
         try:
             while not self._stop.is_set():
@@ -213,7 +249,7 @@ class ChatServer:
                 t = threading.Thread(target=self._handle_client, args=(client_sock, addr), daemon=True)
                 t.start()
         except KeyboardInterrupt:
-            print("\n[i] Server dihentikan.")
+            print("\n[i] Server stopped.")
         finally:
             self.shutdown()
 
@@ -250,9 +286,24 @@ class ChatServer:
             self._clients = [c for c in self._clients if c is not client]
 
     def _handle_client(self, client_sock: socket.socket, addr: tuple[str, int]) -> None:
-        client_sock.settimeout(30)
-        reader = client_sock.makefile("r", encoding="utf-8", newline="\n")
-        writer = client_sock.makefile("w", encoding="utf-8", newline="\n")
+        raw_sock = client_sock
+        raw_sock.settimeout(30)
+
+        sock: socket.socket
+        if self._ssl_context is not None:
+            try:
+                sock = self._ssl_context.wrap_socket(raw_sock, server_side=True)
+            except ssl.SSLError:
+                try:
+                    raw_sock.close()
+                except OSError:
+                    pass
+                return
+        else:
+            sock = raw_sock
+
+        reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        writer = sock.makefile("w", encoding="utf-8", newline="\n")
 
         try:
             _json_send_line(writer, {"type": "hello", "version": PROTOCOL_VERSION})
@@ -269,12 +320,12 @@ class ChatServer:
                 return
 
             if not _verify_password(self.cfg, password):
-                _json_send_line(writer, {"type": "auth_fail", "message": "password_salah"})
+                _json_send_line(writer, {"type": "auth_fail", "message": "invalid_password"})
                 return
 
-            client_sock.settimeout(None)
+            sock.settimeout(None)
             cc = ConnectedClient(
-                sock=client_sock,
+                sock=sock,
                 reader=reader,
                 writer=writer,
                 address=addr,
@@ -285,9 +336,9 @@ class ChatServer:
             with self._clients_lock:
                 self._clients.append(cc)
 
-            _json_send_line(writer, {"type": "auth_ok", "message": "selamat_datang"})
-            self._broadcast({"type": "system", "message": f"{name} bergabung.", "ts": int(time.time())}, exclude=cc)
-            print(f"[+] {name} connected dari {addr[0]}:{addr[1]}")
+            _json_send_line(writer, {"type": "auth_ok", "message": "welcome"})
+            self._broadcast({"type": "system", "message": f"{name} joined.", "ts": int(time.time())}, exclude=cc)
+            print(f"[+] {name} connected from {addr[0]}:{addr[1]}")
 
             while True:
                 msg = _json_recv_line(reader)
@@ -316,17 +367,17 @@ class ChatServer:
             pass
         finally:
             try:
-                client_sock.close()
+                sock.close()
             except OSError:
                 pass
 
             # If authenticated, remove and announce
             try:
                 with self._clients_lock:
-                    known = next((c for c in self._clients if c.sock is client_sock), None)
+                    known = next((c for c in self._clients if c.sock is sock), None)
                 if known is not None:
                     self._remove_client(known)
-                    self._broadcast({"type": "system", "message": f"{known.name} keluar.", "ts": int(time.time())})
+                    self._broadcast({"type": "system", "message": f"{known.name} left.", "ts": int(time.time())})
                     print(f"[-] {known.name} disconnected")
             except Exception:
                 pass
@@ -382,25 +433,57 @@ class ChatClient:
         star = self._c("*", _Ansi.YELLOW)
         print(f"{prefix}{star} {text}")
 
+    def _print_header(self) -> None:
+        width = 62
+        line = "=" * width
+        title = " TERMINAL CHAT "
+        title_line = title.center(width, "=")
+
+        transport = "TLS" if isinstance(self.sock, ssl.SSLSocket) else "TCP"
+        net_path = "VPN/LAN"  # informational label; actual path is determined by your network setup
+
+        def row(label: str, value: str) -> str:
+            label = f"{label}:"
+            return f"{label:<12}{value}"
+
+        print(line)
+        print(self._c(title_line, _Ansi.BOLD) if self.use_color else title_line)
+        print(line)
+        print(row("User", self.name))
+        print(row("Server", f"{self.server_host}:{self.port}"))
+        print(row("Transport", transport))
+        print(row("Network", net_path))
+        print(line)
+        print(self._c("[+] CONNECTED", _Ansi.GREEN) + self._c("  Ready to chat.", _Ansi.DIM))
+        print(self._c("[i] Type and press Enter.", _Ansi.DIM))
+        print(self._c("[i] /help  /quit  /cls", _Ansi.DIM))
+        print("")
+
     def run(self, *, once_message: Optional[str] = None) -> None:
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(15)
-        self.sock.connect((self.server_host, self.port))
-        self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
-        self.writer = self.sock.makefile("w", encoding="utf-8", newline="\n")
+        if self.sock is None:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(15)
+            self.sock.connect((self.server_host, self.port))
+            self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
+            self.writer = self.sock.makefile("w", encoding="utf-8", newline="\n")
+        else:
+            # Socket was pre-established (e.g., TLS-wrapped) by the caller.
+            if self.reader is None or self.writer is None:
+                self.reader = self.sock.makefile("r", encoding="utf-8", newline="\n")
+                self.writer = self.sock.makefile("w", encoding="utf-8", newline="\n")
 
         hello = _json_recv_line(self.reader)
         if not hello or hello.get("type") != "hello":
-            raise RuntimeError("Server tidak kompatibel")
+            raise RuntimeError("Incompatible server")
 
         _json_send_line(self.writer, {"type": "auth", "name": self.name, "password": self.password})
         resp = _json_recv_line(self.reader)
         if not resp:
-            raise RuntimeError("Server tidak merespons")
+            raise RuntimeError("Server did not respond")
         if resp.get("type") == "auth_fail":
-            raise RuntimeError("Password salah")
+            raise RuntimeError("Invalid password")
         if resp.get("type") != "auth_ok":
-            raise RuntimeError(f"Gagal login: {resp}")
+            raise RuntimeError(f"Login failed: {resp}")
 
         # Avoid idle read timeouts: after auth, keep the connection open indefinitely.
         # (The initial 15s timeout is only for connect+handshake.)
@@ -419,17 +502,15 @@ class ChatClient:
             if text:
                 _json_send_line(self.writer, {"type": "msg", "text": text})
                 time.sleep(0.2)
+            try:
+                if self.sock is not None:
+                    self.sock.close()
+            except OSError:
+                pass
             return
 
         os.system("cls" if os.name == "nt" else "clear")
-        banner_left = self._c("OPERATOR CONSOLE", _Ansi.BOLD) if self.use_color else "OPERATOR CONSOLE"
-        print("=" * 46)
-        print(f"{banner_left}  (via VPN)")
-        print("=" * 46)
-        print(self._c("[+] CONNECTED", _Ansi.GREEN) + f"  {self.name} -> {self.server_host}:{self.port}")
-        print(self._c("[i] Ketik pesan lalu Enter.", _Ansi.DIM))
-        print(self._c("[i] Perintah: /help, /quit, /cls", _Ansi.DIM))
-        print("")
+        self._print_header()
 
         t = threading.Thread(target=self._recv_loop, daemon=True)
         t.start()
@@ -446,10 +527,10 @@ class ChatClient:
                 if line.lower() in {"/q", "/quit", "/exit"}:
                     break
                 if line.lower() == "/help":
-                    print("Perintah tersedia:")
-                    print("  /help  - bantuan")
-                    print("  /quit  - keluar")
-                    print("  /cls   - bersihkan layar")
+                    print("Commands:")
+                    print("  /help  Show help")
+                    print("  /quit  Quit")
+                    print("  /cls   Clear screen")
                     continue
                 if line.lower() in {"/cls", "/clear"}:
                     os.system("cls" if os.name == "nt" else "clear")
@@ -474,7 +555,7 @@ class ChatClient:
                 # Should not happen when socket timeout is None, but be defensive.
                 continue
             if msg is None:
-                print("[i] Terputus dari server.")
+                print("[i] Disconnected from server.")
                 self._stop.set()
                 return
 
@@ -500,48 +581,106 @@ def _prompt_if_empty(value: Optional[str], prompt: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Terminal chat (server/client) dengan password")
-    parser.add_argument("--mode", choices=["server", "client"], help="Jalankan sebagai server atau client")
+    parser = argparse.ArgumentParser(description="Terminal chat (server/client) with password")
+    parser.add_argument("--mode", choices=["server", "client"], help="Run as server or client")
 
     parser.add_argument("--host", default="0.0.0.0", help="(server) Bind host, default 0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port, default {DEFAULT_PORT}")
-    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"(server) Path config, default {DEFAULT_CONFIG}")
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help=f"(server) Config path, default {DEFAULT_CONFIG}")
     parser.add_argument("--reset-password", action="store_true", help="(server) Reset password")
 
+    parser.add_argument("--tls", action="store_true", help="Enable TLS transport")
+    parser.add_argument("--tls-cert", help="(server) TLS certificate PEM file")
+    parser.add_argument("--tls-key", help="(server) TLS private key PEM file")
+    parser.add_argument(
+        "--tls-fingerprint",
+        help="(client) Expected server certificate SHA256 fingerprint (hex, optional ':')",
+    )
+
+    parser.add_argument(
+        "--print-fingerprint",
+        metavar="CERT_PEM",
+        help="Print SHA256 fingerprint for a PEM certificate and exit",
+    )
+
     parser.add_argument("--server", dest="server_host", help="(client) IP/hostname server")
-    parser.add_argument("--name", help="(client) Nama pengguna")
-    parser.add_argument("--once", help="(client) Kirim 1 pesan lalu keluar (non-interaktif)")
-    parser.add_argument("--no-color", action="store_true", help="(client) Matikan output berwarna")
-    parser.add_argument("--no-ts", action="store_true", help="(client) Sembunyikan timestamp")
-    parser.add_argument("--no-title", action="store_true", help="(client) Jangan set judul window CMD")
+    parser.add_argument("--name", help="(client) User name")
+    parser.add_argument("--once", help="(client) Send one message then exit (non-interactive)")
+    parser.add_argument("--no-color", action="store_true", help="(client) Disable colored output")
+    parser.add_argument("--no-ts", action="store_true", help="(client) Hide timestamps")
+    parser.add_argument("--no-title", action="store_true", help="(client) Do not set the CMD window title")
 
     args = parser.parse_args()
 
+    if args.print_fingerprint:
+        with open(args.print_fingerprint, "r", encoding="utf-8") as f:
+            pem = f.read()
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        print(_sha256_hex(der))
+        return 0
+
     mode = args.mode
     if not mode:
-        print("Pilih mode: 1) server  2) client")
-        choice = input("Pilihan (1/2): ").strip()
+        print("Select mode: 1) server  2) client")
+        choice = input("Choice (1/2): ").strip()
         mode = "server" if choice == "1" else "client"
 
     if mode == "server":
-        server = ChatServer(host=args.host, port=args.port, config_path=args.config, reset_password=args.reset_password)
+        server = ChatServer(
+            host=args.host,
+            port=args.port,
+            config_path=args.config,
+            reset_password=args.reset_password,
+            tls=bool(args.tls),
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
+        )
         server.serve_forever()
         return 0
 
     # client
     server_host = _prompt_if_empty(args.server_host, "Server IP/hostname: ")
-    name = _prompt_if_empty(args.name, "Nama kamu: ")
+    name = _prompt_if_empty(args.name, "Your name: ")
     password = os.environ.get("CHAT_PASSWORD")
     if password is None:
         password = getpass.getpass("Password: ")
     if not password:
-        print("[!] Password kosong.")
+        print("[!] Empty password.")
         return 2
 
     try:
         use_color = (not args.no_color) and _supports_color()
         show_timestamps = not args.no_ts
         set_title = (os.name == "nt") and (not args.no_title)
+        # Establish TCP socket first, then optionally upgrade to TLS.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect((server_host, args.port))
+
+        if args.tls:
+            fp_expected = _normalize_fp(args.tls_fingerprint) if args.tls_fingerprint else ""
+            if fp_expected:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                tls_sock = ctx.wrap_socket(sock, server_hostname=server_host)
+                cert_bin = tls_sock.getpeercert(binary_form=True) or b""
+                fp_actual = _sha256_hex(cert_bin)
+                if fp_actual != fp_expected:
+                    tls_sock.close()
+                    raise RuntimeError(
+                        "TLS fingerprint mismatch. "
+                        f"Expected {fp_expected}, got {fp_actual}."
+                    )
+                sock = tls_sock
+            else:
+                # Use system trust store + hostname validation (best when using a CA-signed cert).
+                ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+                ctx.check_hostname = True
+                ctx.verify_mode = ssl.CERT_REQUIRED
+                sock = ctx.wrap_socket(sock, server_hostname=server_host)
+
+        # Continue with the regular protocol using the (possibly TLS-wrapped) socket.
         client = ChatClient(
             server_host=server_host,
             port=args.port,
@@ -551,6 +690,9 @@ def main() -> int:
             show_timestamps=show_timestamps,
             set_title=set_title,
         )
+        client.sock = sock
+        client.reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        client.writer = sock.makefile("w", encoding="utf-8", newline="\n")
         client.run(once_message=args.once)
     except Exception as e:
         print(f"[!] Error: {e}")
